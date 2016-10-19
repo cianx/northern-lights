@@ -1,0 +1,676 @@
+{
+	"auto_complete":
+	{
+		"selected_items":
+		[
+			[
+				"bl",
+				"block_publisher"
+			],
+			[
+				"bu",
+				"build"
+			],
+			[
+				"build",
+				"build_transaction_block"
+			],
+			[
+				"pend",
+				"pending_transaction_block"
+			],
+			[
+				"con",
+				"consensus"
+			],
+			[
+				"no",
+				"nodes"
+			],
+			[
+				"pad",
+				"padding"
+			],
+			[
+				"bo",
+				"border"
+			],
+			[
+				"white",
+				"white-space"
+			],
+			[
+				"a",
+				"absolute"
+			],
+			[
+				"ali",
+				"align-items"
+			],
+			[
+				"padd",
+				"padding-left"
+			],
+			[
+				"flex",
+				"flex-direction"
+			],
+			[
+				"back",
+				"background-color"
+			],
+			[
+				"border-b",
+				"border-box"
+			],
+			[
+				"trans",
+				"transparent"
+			],
+			[
+				"he",
+				"height"
+			],
+			[
+				"disp",
+				"display"
+			],
+			[
+				"t",
+				"target"
+			],
+			[
+				"fo",
+				"font7"
+			],
+			[
+				"inline",
+				"inline-block"
+			],
+			[
+				"pos",
+				"position"
+			],
+			[
+				"bord",
+				"border-box"
+			],
+			[
+				"wi",
+				"width"
+			],
+			[
+				"ex",
+				"extend"
+			],
+			[
+				"cab",
+				"cablesShort"
+			],
+			[
+				"cable",
+				"cablesLong"
+			],
+			[
+				"Cab",
+				"CableSet"
+			],
+			[
+				"ro",
+				"rows"
+			],
+			[
+				"co",
+				"cols"
+			],
+			[
+				"pow",
+				"powerRouter"
+			]
+		]
+	},
+	"buffers":
+	[
+		{
+			"contents": "# Copyright 2016 Intel Corporation\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n# ------------------------------------------------------------------------------\n\nimport collections\nimport logging\nimport importlib\n\nfrom time import time\n\nfrom gossip import common, stats\nfrom journal import journal_core\nfrom journal.consensus import Consensus\nfrom journal.consensus.poet0 import poet_transaction_block\nfrom journal.consensus.poet0.wait_timer import WaitTimer\nfrom journal.consensus.poet0.wait_certificate import WaitCertificate\n\nlogger = logging.getLogger(__name__)\n\n\nclass PoetConsensus(Consensus):\n    \"\"\"Implements a journal based on the proof of elapsed time\n    consensus mechanism.\n\n    Attributes:\n        onHeartBeatTimer (EventHandler): The EventHandler tracking\n            calls to make when the heartbeat timer fires.\n        MaximumBlocksToKeep (int): The maximum number of blocks to\n            keep.\n    \"\"\"\n\n    def __init__(self):\n        \"\"\"Constructor for the PoetJournal class.\n\n        Args:\n            node (Node): The local node.\n        \"\"\"\n        super(PoetJournal, self).__init__()\n\n        if 'PoetEnclaveImplementation' in kwargs:\n            enclave_module = kwargs['PoetEnclaveImplementation']\n        else:\n            enclave_module = 'journal.consensus.poet0.poet_enclave_simulator' \\\n                             '.poet0_enclave_simulator'\n\n        poet_enclave = importlib.import_module(enclave_module)\n        poet_enclave.initialize(**kwargs)\n        WaitCertificate.poet_enclave = poet_enclave\n        WaitTimer.poet_enclave = poet_enclave\n\n    def initialization_complete(self, journal):\n        # propagate the maximum blocks to keep\n        journal.maximum_blocks_to_keep = max(journal.maximum_blocks_to_keep,\n                                          WaitTimer.certificate_sample_length)\n        # initialize stats specifically for the block chain journal\n        journal.JournalStats.add_metric(stats.Value('LocalMeanTime', 0))\n        journal.JournalStats.add_metric(stats.Value('AggregateLocalMean', '0'))\n        journal.JournalStats.add_metric(stats.Value('PopulationEstimate', '0'))\n        journal.JournalStats.add_metric(stats.Value('ExpectedExpirationTime',\n                                                 '0'))\n        journal.JournalStats.add_metric(stats.Value('Duration', '0'))\n\n        # initialize the block handlers\n        poet_transaction_block.register_message_handlers(self)\n\n    def build_block(self, journal, genesis=False):\n        \"\"\"Builds a transaction block that is specific to this particular\n        consensus mechanism, in this case we build a block that contains a\n        wait certificate.\n\n        Args:\n            genesis (boolean): Whether to force creation of the initial\n                block.\n\n        Returns:\n            PoetTransactionBlock: The constructed block with the wait\n                certificate.\n        \"\"\"\n        logger.debug('attempt to build transaction block extending %s',\n                     journal.most_recent_committed_block_id[:8])\n        # Create a new block from all of our pending transactions\n        nblock = poet_transaction_block.PoetTransactionBlock()\n        nblock.BlockNum = journal.most_recent_committed_block.BlockNum \\\n            + 1 if journal.most_recent_committed_block else 0\n        nblock.PreviousBlockID = journal.most_recent_committed_block_id\n\n        journal.on_pre_build_block.fire(journal, nblock)\n\n        # Get the list of prepared transactions, if there aren't enough\n        # then just return\n        txnlist = journal._prepare_transaction_list(\n            journal.maximum_transactions_per_block)\n        transaction_time_waiting = time() - \\\n                journal.transaction_enqueue_time\\\n            if journal.transaction_enqueue_time is not None else 0\n\n        if len(txnlist) < journal.minimum_transactions_per_block and\\\n                not genesis and\\\n                transaction_time_waiting <\\\n                journal.MaximumTransactionsWaitTime:\n            logger.debug('Not enough transactions(%d, %d required) to '\n                         'build block, no block constructed. Mandatory'\n                         'block creation in %f seconds',\n                         len(txnlist),\n                         journal.minimum_transactions_per_block,\n                         journal.MaximumTransactionsWaitTime -\n                         transaction_time_waiting)\n            return None\n        else:\n            # we know that the transaction list is a subset of the\n            # pending transactions, if it is less then all of them\n            # then set the TransactionEnqueueTime we can track these\n            # transactions wait time.\n            remaining_transactions = len(journal.pending_transactions) - \\\n                len(txnlist)\n            journal.transaction_enqueue_time =\\\n                time() if remaining_transactions > 0 else None\n\n        logger.info('build transaction block to extend %s with %s '\n                    'transactions',\n                    journal.most_recent_committed_block_id[:8], len(txnlist))\n\n        # Create a new block from all of our pending transactions\n        nblock = poet_transaction_block.PoetTransactionBlock()\n        nblock.BlockNum = journal.most_recent_committed_block.BlockNum \\\n            + 1 if journal.most_recent_committed_block else 0\n        nblock.PreviousBlockID = journal.most_recent_committed_block_id\n        nblock.TransactionIDs = txnlist\n\n        nblock.create_wait_timer(\n            journal.local_node.signing_address(),\n            journal._build_certificate_list(journal.block_store, nblock))\n\n        journal.JournalStats.LocalMeanTime.Value = nblock.WaitTimer.local_mean\n        journal.JournalStats.PopulationEstimate.Value = \\\n            round(nblock.WaitTimer.local_mean /\n                  nblock.WaitTimer.target_wait_time, 2)\n\n        if genesis:\n            nblock.AggregateLocalMean = nblock.WaitTimer.local_mean\n\n        journal.JournalStats.PreviousBlockID.Value = nblock.PreviousBlockID\n\n        # must put a cap on the transactions in the block\n        if len(nblock.TransactionIDs) >= \\\n                journal.maximum_transactions_per_block:\n            nblock.TransactionIDs = \\\n                nblock.TransactionIDs[:journal.maximum_transactions_per_block]\n\n        logger.debug('created new pending block with timer <%s> and '\n                     '%d transactions', nblock.WaitTimer,\n                     len(nblock.TransactionIDs))\n\n        journal.JournalStats.ExpectedExpirationTime.Value = \\\n            round(nblock.WaitTimer.request_time +\n                  nblock.WaitTimer.duration, 2)\n\n        journal.JournalStats.Duration.Value = \\\n            round(nblock.WaitTimer.duration, 2)\n\n        for txnid in nblock.TransactionIDs:\n            txn = journal.transaction_store[txnid]\n            txn.InBlock = \"Uncommitted\"\n            journal.transaction_store[txnid] = txn\n\n        return nblock\n\n    def claim_block(self, journal, block):\n        \"\"\"Claims the block and transmits a message to the network\n        that the local node won.\n\n        Args:\n            block (PoetTransactionBlock): The block to claim.\n        Returns: \n            message: the block message to broadcast to the network. \n        \"\"\"\n        logger.info('node %s validates block with %d transactions',\n                    journal.local_node.Name, len(block.TransactionIDs))\n\n        # Claim the block\n        block.create_wait_certificate()\n        block.sign_from_node(journal.local_node)\n        journal.JournalStats.BlocksClaimed.increment()\n\n        # Fire the event handler for block claim\n        journal.on_claim_block.fire(journal, block)\n\n        # And send out the message that we won\n        msg = poet_transaction_block.PoetTransactionBlockMessage()\n        msg.TransactionBlock = block\n        return msg\n\n    def _build_certificate_list(self, block_store, block):\n        # for the moment we just dump all of these into one list,\n        # not very efficient but it makes things a lot easier to maintain\n        certs = collections.deque()\n        count = WaitTimer.certificate_sample_length\n\n        while block.PreviousBlockID != common.NullIdentifier \\\n                and len(certs) < count:\n            block = block_store[block.PreviousBlockID]\n            certs.appendleft(block.WaitCertificate)\n\n        # drop the root block off the computation\n        return list(certs)\n\n    def check_claim_block(self, block, now):\n        return block.wait_timer_is_expired(now)\n\n",
+			"file": "/home/cian/Workspaces/sawtooth/sawtooth-core/validator/journal/consensus/poet0/poet_consensus.py",
+			"file_size": 8957,
+			"file_write_time": 131211175226982831,
+			"settings":
+			{
+				"buffer_size": 9044,
+				"encoding": "UTF-8",
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"contents": "# Copyright 2016 Intel Corporation\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n# ------------------------------------------------------------------------------\n\nimport logging\nfrom time import time\nfrom journal import journal_core\nfrom journal.consensus import Consensus\nfrom journal.consensus.dev_mode import dev_mode_transaction_block\n\nlogger = logging.getLogger(__name__)\n\n\nclass DevModeJournal(Consensus):\n    \"\"\"Implements a journal based on the DevMode consensus.\n\n    Attributes:\n        block_publisher (EventHandler): The EventHandler tracking\n            calls to make when the heartbeat timer fires.\n    \"\"\"\n    def __init__(self,\n                 block_publisher=None,\n                 block_wait_time=None):\n        \"\"\"Constructor for the DevModeJournal class.\n\n        Args:\n            node (Node): The local node.\n        \"\"\"\n\n        # the one who can publish blocks is always the genesis ledger\n        self._block_publisher = True\n        if block_publisher is not None:\n            self._block_publisher = block_publisher\n        self._block_wait_time = 1\n        if block_wait_time is not None:\n            self._block_wait_time = int(block_wait_time)\n\n        # default invalid block wait times to 1 second setting to\n        if not isinstance(self.block_wait_time, (int, long)):\n            self.block_wait_time = 1\n\n        self._next_block_time = time()\n\n    def initialization_complete(self, journal):\n        # initialize the block handlers\n        dev_mode_transaction_block.register_message_handlers(self)\n\n    def build_block(self, journal, force=False):\n        \"\"\"Builds a transaction block that is specific to this particular\n        consensus mechanism, in this case we build a block that contains a\n        wait certificate.\n\n        Args:\n            force (boolean): Whether to force creation of the initial\n                block.\n\n        Returns:\n            DevModeTransactionBlock: candidate transaction block\n        \"\"\"\n        if not self._block_publisher:\n            return None\n\n        if not force and \\\n                len(journal.pending_transactions) == 0:\n            return None\n\n        logger.debug('attempt to build transaction block extending %s',\n                     journal.most_recent_committed_block_id[:8])\n\n        logger.info('build transaction block to extend %s'\n                    'transactions', journal.most_recent_committed_block_id[:8])\n\n        # Create a new block from all of our pending transactions\n        new_block = dev_mode_transaction_block.DevModeTransactionBlock()\n        new_block.BlockNum = journal.most_recent_committed_block.BlockNum \\\n            + 1 if journal.most_recent_committed_block else 0\n        new_block.PreviousBlockID = journal.most_recent_committed_block_id\n        journal.on_pre_build_block.fire(journal, new_block)\n\n        # must put a cap on the transactions in the block\n        if len(new_block.TransactionIDs) >= \\\n                journal.maximum_transactions_per_block:\n            new_block.TransactionIDs = \\\n                new_block.TransactionIDs\\\n                [:journal.maximum_transactions_per_block]\n\n        logger.debug('created new pending block')\n\n        journal._next_block_time = time() + journal._block_wait_time\n        return new_block\n\n    def claim_block(self, journal, block):\n        \"\"\"Claims the block and transmits a message to the network\n        that the local node won.\n\n        Args:\n            nblock (DevModeTransactionBlock): The block to claim.\n        \"\"\"\n\n        txn_list = journal._prepare_transaction_list(\n            journal.maximum_transactions_per_block)\n        nblock.TransactionIDs = txn_list\n\n        logger.info('node %s validates block with %d transactions',\n                    journal.local_node.Name, len(nblock.TransactionIDs))\n\n        # Claim the block\n        nblock.sign_from_node(journal.local_node)\n        journal.JournalStats.BlocksClaimed.increment()\n\n        # Fire the event handler for block claim\n        journal.on_claim_block.fire(self, nblock)\n\n        # And send out the message that we won\n        msg = dev_mode_transaction_block.DevModeTransactionBlockMessage()\n        msg.TransactionBlock = nblock\n        return msg\n\n    def check_claim_block(self, block, now):\n        if self.pending_transaction_block and \\\n                len(self.pending_transactions) != 0 and \\\n                time() > self.next_block_time:\n            self.claim_transaction_block(self.pending_transaction_block)\n",
+			"file": "/home/cian/Workspaces/sawtooth/sawtooth-core/validator/journal/consensus/dev_mode/dev_mode_consensus.py",
+			"file_size": 5011,
+			"file_write_time": 131211168473902214,
+			"settings":
+			{
+				"buffer_size": 4984,
+				"encoding": "UTF-8",
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"file": "/home/cian/Workspaces/sawtooth/sawtooth-core/validator/journal/consensus/poet1/poet_consensus.py",
+			"settings":
+			{
+				"buffer_size": 11613,
+				"encoding": "UTF-8",
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"contents": "# Copyright 2016 Intel Corporation\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n# ------------------------------------------------------------------------------\n\nimport json\nimport os\nimport re\nimport sys\nimport warnings\n\nfrom collections import namedtuple\n\nimport sawtooth.config\nfrom sawtooth.config import AggregateConfig\nfrom sawtooth.config import load_config_files\n\n\nListenListEntry = namedtuple('ListenListEntry', ['host', 'port', 'protocol'])\nListenData = namedtuple('ListenData', ['host', 'port'])\n\n\ndef parse_configuration_files(cfiles, search_path):\n    cfg = {}\n    files_found = []\n    files_not_found = []\n\n    for cfile in cfiles:\n        filename = None\n        for directory in search_path:\n            if os.path.isfile(os.path.join(directory, cfile)):\n                filename = os.path.join(directory, cfile)\n                break\n\n        if filename is None:\n            files_not_found.append(cfile)\n        else:\n            files_found.append(filename)\n\n    if len(files_not_found) > 0:\n        warnings.warn(\n            \"Unable to locate the following configuration files: \"\n            \"{0} (search path: {1})\".format(\n                \", \".join(files_not_found),\n                \", \".join([os.path.realpath(d) for d in search_path])))\n        sys.exit(-1)\n\n    for filename in files_found:\n        try:\n            cfg.update(parse_configuration_file(filename))\n        except IOError as detail:\n            warnings.warn(\"Error parsing configuration file %s; IO error %s\" %\n                          (filename, str(detail)))\n            sys.exit(-1)\n        except ValueError as detail:\n            warnings.warn(\"Error parsing configuration file %s; value error %s\"\n                          % (filename, str(detail)))\n            sys.exit(-1)\n        except NameError as detail:\n            warnings.warn(\"Error parsing configuration file %s; name error %s\"\n                          % (filename, str(detail)))\n            sys.exit(-1)\n        except:\n            warnings.warn('Error parsing configuration file %s; %s' %\n                          (filename, sys.exc_info()[0]))\n            sys.exit(-1)\n\n    return cfg\n\n\ndef parse_configuration_file(filename):\n    cpattern = re.compile('##.*$')\n\n    with open(filename) as fp:\n        lines = fp.readlines()\n\n    text = \"\"\n    for line in lines:\n        text += re.sub(cpattern, '', line) + ' '\n\n    return json.loads(text)\n\n\ndef get_config_directory(configs):\n    agg = AggregateConfig(configs=configs)\n\n    for key in agg.keys():\n        if key not in ['CurrencyHome', 'ConfigDirectory']:\n            del agg[key]\n\n    return agg.resolve({'home': 'CurrencyHome'})['ConfigDirectory']\n\n\ndef get_validator_configuration(config_files,\n                                options_config,\n                                os_name=os.name,\n                                config_files_required=None):\n    env_config = CurrencyEnvConfig()\n\n    default_config = ValidatorDefaultConfig(os_name=os_name)\n\n    conf_dir = get_config_directory(\n        [default_config, env_config, options_config])\n\n    # Determine the configuration file search path\n    search_path = [conf_dir, '.', os.path.join(\n        os.path.dirname(__file__), \"..\", \"etc\")]\n\n    # Require the config files unless it is an empty list or the\n    # default of txnvalidator.js.\n    if config_files_required is None:\n        config_files_required = len(config_files) != 0 and \\\n            not (len(config_files) == 1 and\n                 config_files[0] == 'txnvalidator.js')\n\n    file_configs = load_config_files(config_files, search_path,\n                                     config_files_required)\n\n    config_list = [default_config]\n    config_list.extend(file_configs)\n    config_list.append(env_config)\n    config_list.append(options_config)\n\n    cfg = AggregateConfig(configs=config_list)\n    resolved = cfg.resolve({\n        'home': 'CurrencyHome',\n        'host': 'CurrencyHost',\n        'node': 'NodeName',\n        'base': 'BaseDirectory',\n        'conf_dir': 'ConfigDirectory',\n        'data_dir': 'DataDirectory',\n        'log_dir': 'LogDirectory',\n        'key_dir': 'KeyDirectory',\n        'run_dir': 'RunDirectory'\n    })\n    return resolved\n\n\n__IPV4_REGEX = \\\n    r'(?:(?:\\d|[1-9]\\d|1\\d{2}|2[0-4]\\d|25[0-5])\\.){3}' \\\n    r'(?:\\d|[1-9]\\d|1[0-9]{2}|2[0-4]\\d|25[0-5])'\n__HOST_NAME_REGEX = \\\n    r'localhost|(?:(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\\-]{0,61}[a-zA-Z0-9])' \\\n    r'(?:\\.(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\\-]{0,61}[a-zA-Z0-9]))+)'\n__PORT_REGEX = \\\n    r'[0-9]|[1-9][0-9]{1,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|' \\\n    r'655[0-2][0-9]|6553[0-5]'\n__TRANSPORT_REGEX = r'UDP|TCP'\n__PROTOCOL_REGEX = r'gossip|http'\n__FULL_REGEX = \\\n    r'^(?:(?P<host>{0}|{1})(?::))?(?P<port>{2})(?:(?:/)(?P<transport>{3}))' \\\n    r'?\\s+(?P<protocol>{4})$'.format(\n        __IPV4_REGEX,\n        __HOST_NAME_REGEX,\n        __PORT_REGEX,\n        __TRANSPORT_REGEX,\n        __PROTOCOL_REGEX)\n__LISTEN_REGEX = re.compile(__FULL_REGEX)\n\n\ndef _parse_listen_directive(value):\n    \"\"\"\n    An internal helper that parses a listen entry, checks for validity,\n    and fills in defaults for missing values.\n\n    Args:\n        value: A listen string that is expected to be in the form\n         \"[IP_OR_HOST_NAME:]PORT[/TRANSPORT] PROTOCOL\"\n\n    Returns:\n        A named tuple of (host, port, protocol)\n    \"\"\"\n\n    # Beat the string senseless using a regex.  If there is not a match, then\n    # it is malformed\n    match = __LISTEN_REGEX.match(value)\n    if match is None:\n        raise Exception('listen directive \"{}\" is malformed'.format(value))\n\n    # Extract the pieces of data we need.  Note that for optional pieces\n    # host and transport, missing values will be None.  For a missing host\n    # value, we will provide 0.0.0.0, which basically means listen on all\n    # interfaces.\n    host = match.group('host')\n    if host is None:\n        host = '0.0.0.0'\n    port = int(match.group('port'))\n    transport = match.group('transport')\n    protocol = match.group('protocol')\n\n    # Make sure that if there is a transport that it matches the protocol\n    if transport is not None:\n        if protocol == 'gossip' and transport != 'UDP':\n            raise Exception('gossip listen directive requires UDP')\n        if protocol == 'http' and transport != 'TCP':\n            raise Exception('http listen directive requires TCP')\n\n    # For HTTP, we don't allow listening on an ephemeral port\n    if protocol == 'http' and port == 0:\n        raise Exception('http listen directive requires non-zero port')\n\n    return ListenListEntry(\n        host=host,\n        port=port,\n        protocol=protocol)\n\n\ndef parse_listen_directives(listen_info):\n    \"\"\"\n    From the configuration object, parses the list of entries for \"Listen\"\n    and returns a dictionary of mapping from protocol to address/hostname\n    and port.\n\n    Args:\n        config: The object holding validator configuration\n\n    Returns:\n        A dictionary mapping a protocol name to a ListenData named tuple.\n    \"\"\"\n\n    listen_mapping = {}\n\n    # First try to parse the \"Listen\" entries if one exists\n    if listen_info is not None:\n        for value in listen_info:\n            directive = _parse_listen_directive(value)\n\n            # No duplicates for protocols allowed\n            if directive.protocol in listen_mapping:\n                raise Exception(\n                    'configuration has more than one {0} listen '\n                    'directive'.format(directive.protocol))\n\n            listen_mapping[directive.protocol] = \\\n                ListenData(host=directive.host, port=directive.port)\n\n        # If there was no gossip listen directive, then flag an error\n        if 'gossip' not in listen_mapping:\n            raise Exception('configuration requires gossip listen directive')\n\n    # Otherwise, we are going to set defaults for both gossip and HTTP\n    else:\n        listen_mapping['gossip'] = ListenData(host='0.0.0.0', port=5500)\n        listen_mapping['http'] = ListenData(host='0.0.0.0', port=8800)\n\n    return listen_mapping\n\n\nclass ValidatorDefaultConfig(sawtooth.config.Config):\n    def __init__(self, os_name=os.name):\n        super(ValidatorDefaultConfig, self).__init__(name=\"default\")\n\n        # file paths for validator data and process information\n        if 'CURRENCYHOME' in os.environ:\n            self['ConfigDirectory'] = '{home}/etc'\n            self['LogDirectory'] = '{home}/logs'\n            self['DataDirectory'] = '{home}/data'\n            self['KeyDirectory'] = '{home}/keys'\n            self['RunDirectory'] = '{home}/run'\n            self['PidFile'] = '{run_dir}/{node}.pid'\n        elif os_name == 'nt':\n            base_dir = 'C:\\\\Program Files (x86)\\\\Intel\\\\sawtooth-validator\\\\'\n            self['ConfigDirectory'] = '{0}conf'.format(base_dir)\n            self['LogDirectory'] = '{0}logs'.format(base_dir)\n            self['DataDirectory'] = '{0}data'.format(base_dir)\n            self['KeyDirectory'] = '{0}conf\\\\keys'.format(base_dir)\n            self['RunDirectory'] = '{0}\\\\run'.format(base_dir)\n        else:\n            self['ConfigDirectory'] = '/etc/sawtooth-validator'\n            self['LogDirectory'] = '/var/log/sawtooth-validator'\n            self['DataDirectory'] = '/var/lib/sawtooth-validator'\n            self['KeyDirectory'] = '/etc/sawtooth-validator/keys'\n            self['RunDirectory'] = '/var/run/sawtooth-validator'\n            self['PidFile'] = '{run_dir}/{node}.pid'\n        self['BaseDirectory'] = os.path.abspath(os.path.dirname(__file__))\n\n        # validator identity\n        self['NodeName'] = \"base000\"\n        self['KeyFile'] = '{key_dir}/{node}.wif'\n\n        # validator network exposure\n        self[\"Listen\"] = [\n            \"localhost:0/UDP gossip\",\n            \"localhost:8800/TCP http\"\n        ]\n        # publicly-visible endpoint information if validator is behind NAT\n        # self[\"Endpoint\"] = {\n        #     \"Host\" : \"localhost\",\n        #     \"Port\" : 5500,\n        #     \"HttpPort\" : 8800\n        # }\n        self['Endpoint'] = None\n\n        # network flow control\n        self['NetworkFlowRate'] = 96000\n        self['NetworkBurstRate'] = 128000\n        self['NetworkDelayRange'] = [0.00, 0.10]\n        self['UseFixedDelay'] = True\n\n        # startup options\n        self['LedgerURL'] = 'http://localhost:8800/'\n        self['GenesisLedger'] = False\n        self['Restore'] = False\n\n        # topological configuration\n        self['TopologyAlgorithm'] = 'RandomWalk'\n        self['InitialConnectivity'] = 1\n        self['TargetConnectivity'] = 3\n        self['MaximumConnectivity'] = 15\n        self['MinimumConnectivity'] = 1\n\n        # concrete topologic specification\n        # Nodes specifies apriori validators for e.g. fixed topologies, e.g:\n        # self['Nodes'] = [\n        #     {\n        #         'NodeName': <a validator's name>,\n        #         'Identity': <said validator's public key>,\n        #         'Host': <said validator's hostname>,\n        #         'Port': <said validator's gossip/udp port>,\n        #         'HttpPort': <said validator's web api port>,\n        #     },\n        # ]\n        self['Nodes'] = []\n        # Peers specifies peers from Nodes (above) by validator name, e.g.:\n        # self['Peers'] = [<a validator's name>, ]\n        self[\"Peers\"] = []\n\n        # PoET wait time certificates\n        self['CertificateSampleLength'] = 30\n        # the values TargetWaitTime and InitialWaitTime are a function of\n        # network size.  The defaults of 5.0, 5.0 are geared toward very small\n        # developer networks.  A larger network of n nodes might use 30.0 for\n        # TargetWaitTime, and then set InitialWaitTime to n * TargetWaitTime\n        self['TargetWaitTime'] = 5.0\n        self['InitialWaitTime'] = 5.0\n\n        # ledger type (PoET default)\n        self['LedgerType'] = 'poet0'\n\n        # block-chain transaction limits\n        self['MinTransactionsPerBlock'] = 1\n        self['MaxTransactionsPerBlock'] = 1000\n\n        # transaction families\n        self['TransactionFamilies'] = [\n            'ledger.transaction.integer_key'\n        ]\n\n        # public key allowed to send shutdown messages\n        self['AdministrationNode'] = None\n\n        # R&D options\n        self['Profile'] = True\n\n        # legacy settings\n        self['CurrencyHost'] = \"localhost\"\n\n        # security settings\n        self['CheckElevated'] = False\n\n\nclass CurrencyEnvConfig(sawtooth.config.EnvConfig):\n    def __init__(self):\n        super(CurrencyEnvConfig, self).__init__([\n            ('CURRENCYHOME', 'CurrencyHome'),\n            ('CURRENCY_CONF_DIR', 'ConfigDirectory'),\n            ('CURRENCY_LOG_DIR', 'LogDirectory'),\n            ('CURRENCY_DATA_DIR', 'DataDirectory'),\n            ('CURRENCY_RUN_DIR', 'RunDirectory'),\n            ('HOSTNAME', 'CurrencyHost')\n        ])\n",
+			"file": "/home/cian/Workspaces/sawtooth/sawtooth-core/core/sawtooth/validator_config.py",
+			"file_size": 13524,
+			"file_write_time": 131205313376389534,
+			"settings":
+			{
+				"buffer_size": 13328,
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"file": "/home/cian/Workspaces/sawtooth/sawtooth-core/validator/txnmain/validator_cli.py",
+			"settings":
+			{
+				"buffer_size": 19677,
+				"encoding": "UTF-8",
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"file": "/home/cian/Workspaces/sawtooth/sawtooth-core/validator/journal/journal_core.py",
+			"settings":
+			{
+				"buffer_size": 60347,
+				"encoding": "UTF-8",
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"contents": "# Copyright 2016 Intel Corporation\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n# ------------------------------------------------------------------------------\n\n\nclass Consensus(object):\n    \"\"\"Consensucons objects provide the following services to the Journal:\n    1) Build canidated blocks ( this temporary until the block types are\n    combined into a single block type)\n    2) Check if it is time to claim the current canidate blocks.\n    3) Provide the data a signatures required for a block to be validated by\n    other consensus algorithms\n    4) validations that blocks received from other validators meet the\n    consensus rules.\n\n    \"\"\"\n    def initialization_complete(self, journal):\n        \"\"\"Last call in the journal initialization sequence, giving the\n        consensus object a chance to intitialize and register it's messages\n        \"\"\"\n\n        pass\n\n    def build_block(self, journal, genesis=False):\n        \"\"\"Build a new canidate transaction block. This can be called\n        as a result of the previous canidate block being claimed or a new\n        block arriving and becoming the current head of the chain after\n        validation.\n\n        Args:\n            journal (Journal): the current journal object\n            genesis: flag indicating if this is the genesis block, so\n            creation should be forced.\n        Returns:\n            block: the canidate transaction block\n        \"\"\"\n        pass\n\n    def check_claim_block(self, block, now):\n        \"\"\"Build a new canidate transaction block. This can be called\n        as a result of the previous canidate block being claimed or a new\n        block arriving and becoming the current head of the chain after\n        validation.\n\n        Args:\n            journal (Journal): the current journal object\n            genesis: flag indicating if this is the genesis block, so\n            creation should be forced.\n        Returns:\n            Boolean: True if the canidate block should be claimed.\n        \"\"\"\n        pass\n\n    def claim_block(self, journal, block):\n        \"\"\"Finalize the transaction block. Provide any signatures and\n        data updates that need to be applied to the block before it is\n        signed and broadcast to the network.\n\n        Args:\n            journal (Journal): the current journal object\n            block: The canidate block that\n        Returns:\n            None\n        \"\"\"\n        pass\n\n    def verify_block(self, journal, block):\n        \"\"\" Check that a block has the proper consenseus\n        signature and meets all of the consensus restrictions to extend\n        the chain. Transactions a block integrity are validated by the Journal,\n        this only validates that the block meets the rules implied by the\n        consensus algorith.\n\n        Args:\n            journal (Journal): the current journal object\n            block ()\n        Returns:\n            None: all errors are expected to be thrown.\n\n        \"\"\"\n        pass\n",
+			"file": "/home/cian/Workspaces/sawtooth/sawtooth-core/validator/journal/consensus/consensus.py",
+			"file_size": 3453,
+			"file_write_time": 131211090546278011,
+			"settings":
+			{
+				"buffer_size": 3461,
+				"encoding": "UTF-8",
+				"line_ending": "Unix"
+			}
+		}
+	],
+	"build_system": "",
+	"build_system_choices":
+	[
+	],
+	"build_varint": "",
+	"command_palette":
+	{
+		"height": 221.0,
+		"last_filter": "insta",
+		"selected_items":
+		[
+			[
+				"insta",
+				"Package Control: Install Package"
+			]
+		],
+		"width": 749.0
+	},
+	"console":
+	{
+		"height": 216.0,
+		"history":
+		[
+			"import urllib.request,os,hashlib; h = '2915d1851351e5ee549c20394736b442' + '8bc59f460fa1548d1514676163dafc88'; pf = 'Package Control.sublime-package'; ipp = sublime.installed_packages_path(); urllib.request.install_opener( urllib.request.build_opener( urllib.request.ProxyHandler()) ); by = urllib.request.urlopen( 'http://packagecontrol.io/' + pf.replace(' ', '%20')).read(); dh = hashlib.sha256(by).hexdigest(); print('Error validating download (got %s instead of %s), please try manual install' % (dh, h)) if dh != h else open(os.path.join( ipp, pf), 'wb' ).write(by)",
+			"Install Package SCSS",
+			"import urllib.request,os,hashlib; h = '2915d1851351e5ee549c20394736b442' + '8bc59f460fa1548d1514676163dafc88'; pf = 'Package Control.sublime-package'; ipp = sublime.installed_packages_path(); urllib.request.install_opener( urllib.request.build_opener( urllib.request.ProxyHandler()) ); by = urllib.request.urlopen( 'http://packagecontrol.io/' + pf.replace(' ', '%20')).read(); dh = hashlib.sha256(by).hexdigest(); print('Error validating download (got %s instead of %s), please try manual install' % (dh, h)) if dh != h else open(os.path.join( ipp, pf), 'wb' ).write(by)"
+		]
+	},
+	"distraction_free":
+	{
+		"menu_visible": true,
+		"show_minimap": false,
+		"show_open_files": false,
+		"show_tabs": false,
+		"side_bar_visible": false,
+		"status_bar_visible": false
+	},
+	"expanded_folders":
+	[
+		"/home/cian/Workspaces/sawtooth",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/core",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/core/sawtooth",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/validator",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/validator/journal",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/validator/journal/consensus",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/validator/journal/consensus/dev_mode",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/validator/journal/consensus/poet0",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/validator/journal/consensus/poet1",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/validator/journal/consensus/quorum",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/validator/tests/integration",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/validator/txnmain",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/validator/txnserver",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/validator/txnserver/static_content"
+	],
+	"file_history":
+	[
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/validator/txnserver/web_pages/forward_page.py",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/validator/journal/consensus/quorum/quorum_consensus.py",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/validator/txnmain/admin_cli.py",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/validator/tests/integration/test_smoke.py",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/docs/source/txn_family_tutorial.rst",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/validator/journal/consensus_base.py",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/validator/build/lib.linux-x86_64-2.7/journal/journal_core.py",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/validator/journal/block_publisher",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/validator/gossip/topology/quorum.py",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/validator/build/lib.linux-x86_64-2.7/gossip/topology/quorum.py",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/docs/source/sawtooth_developers_guide/architecture_overview.rst",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/validator/journal/consensus/dev_mode/dev_mode_transaction_block.py",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/docs/source/introduction.rst",
+		"/home/cian/Workspaces/sawtooth/sawtooth-core/validator/TestSmokeResultsDevMode/validator-0-debug.log",
+		"/home/cian/Workspaces/programming-questions/fizz-buzz/README.md",
+		"/home/cian/Workspaces/programming-questions/greatest-common-denominator/README.md",
+		"/home/cian/Workspaces/programming-questions/vagrant/bashrc",
+		"/home/cian/Workspaces/programming-questions/fizz-buzz/py3/fizzbuzz.py",
+		"/home/cian/Workspaces/programming-questions/fizz-buzz/py3/fizzbuzz-2.py",
+		"/home/cian/Workspaces/programming-questions/fizz-buzz/rust/fizz-buzz/Cargo.toml",
+		"/home/cian/Workspaces/programming-questions/fizz-buzz/rust/fizz-buzz/src/main.rs",
+		"/home/cian/Workspaces/programming-questions/fibbonaci/py3/fibbonaci.py",
+		"/home/cian/Workspaces/programming-questions/fibbonaci/c/fibbonaci-i.c",
+		"/home/cian/Workspaces/programming-questions/strings/README.md",
+		"/home/cian/Workspaces/programming-questions/todo/README.md",
+		"/home/cian/Workspaces/programming-questions/stock-price/README.md",
+		"/home/cian/Workspaces/programming-questions/mine-sweeper/README.md",
+		"/home/cian/Workspaces/programming-questions/fibbonaci/c/CMakeLists.txt",
+		"/home/cian/Workspaces/programming-questions/fibbonaci/c/fibbonaci-r.c",
+		"/home/cian/Workspaces/programming-questions/.gitignore",
+		"/home/cian/Workspaces/programming-questions/vagrant/Vagrantfile",
+		"/home/cian/Workspaces/programming-questions/vagrant/provision.sh",
+		"/C/Users/Cian/Workspaces/planar-case-studies/conf/Gulpfile.js",
+		"/C/Users/Cian/Workspaces/planar-case-studies/src/case-study.html",
+		"/C/Users/Cian/Workspaces/planar-case-studies/src/planar-case-studies.scss",
+		"/C/Users/Cian/Workspaces/planar-case-studies/src/index.html",
+		"/C/Users/Cian/Workspaces/planar-case-studies/dist/index.html",
+		"/C/Users/Cian/Workspaces/planar-case-studies/src/fpo/component_image-processor.jpg",
+		"/C/Users/Cian/Workspaces/planar-case-studies/src/assets/icon_search.png",
+		"/C/Users/Cian/AppData/Roaming/Sublime Text 3/Packages/User/Sass.sublime-settings",
+		"/C/Users/Cian/Workspaces/planar-case-studies/src/assets/checkbox-on.png",
+		"/C/Users/Cian/Workspaces/goserv/goserv.go",
+		"/C/Users/Cian/Workspaces/go/values.go",
+		"/C/Users/Cian/Workspaces/planar-routing/tmp/router.js",
+		"/C/Users/Cian/Workspaces/planar-routing/tmp/route.js",
+		"/C/Users/Cian/Workspaces/planar-routing/tmp/readme.txt",
+		"/C/Users/Cian/.ssh/config",
+		"/C/Users/Cian/Workspaces/planar-routing/tmp/cable-sets",
+		"/C/Users/Cian/Downloads/setup-x86_64 (2).exe",
+		"/C/Users/Cian/Workspaces/planar-routing/tmp/route-blocks.js",
+		"/C/Users/Cian/Workspaces/planar-routing/tmp/route-blocks.json"
+	],
+	"find":
+	{
+		"height": 35.0
+	},
+	"find_in_files":
+	{
+		"height": 93.0,
+		"where_history":
+		[
+			"-*/build,-*/.coverage,-*/htmlcov,-*/lib.*",
+			"-*/build,-*/.coverage,-*/htmlcov,-*/lib",
+			"-*/build,-*/.coverage,-*/htmlcov",
+			"-build,-.coverage,-htmlcov",
+			"-build,-.coverage",
+			"-build,-\\.coverage",
+			"-build;-.coverage",
+			"-build",
+			""
+		]
+	},
+	"find_state":
+	{
+		"case_sensitive": false,
+		"find_history":
+		[
+			"claim_block",
+			"maximum_blocks_to_keep",
+			"build_trans",
+			"claim_transaction_block",
+			"_check_certificate",
+			"build_transaction_block",
+			"Quorum",
+			"DevModeJournal",
+			"quorum",
+			"do_dumpquorum",
+			"PendingTransactionBlock",
+			"in",
+			"width: 478px;",
+			"filter-title-search",
+			"slider-find",
+			";\n",
+			"groups.p",
+			"ComputeRouteDisplaySize"
+		],
+		"highlight": true,
+		"in_selection": false,
+		"preserve_case": false,
+		"regex": false,
+		"replace_history":
+		[
+			"pending_transaction_block"
+		],
+		"reverse": false,
+		"show_context": true,
+		"use_buffer2": true,
+		"whole_word": false,
+		"wrap": true
+	},
+	"groups":
+	[
+		{
+			"selected": 1,
+			"sheets":
+			[
+				{
+					"buffer": 0,
+					"file": "/home/cian/Workspaces/sawtooth/sawtooth-core/validator/journal/consensus/poet0/poet_consensus.py",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 9044,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								7775,
+								7775
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/Python/Python.sublime-syntax"
+						},
+						"translation.x": 0.0,
+						"translation.y": 2850.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 1,
+					"type": "text"
+				},
+				{
+					"buffer": 1,
+					"file": "/home/cian/Workspaces/sawtooth/sawtooth-core/validator/journal/consensus/dev_mode/dev_mode_consensus.py",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 4984,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								4805,
+								4805
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/Python/Python.sublime-syntax"
+						},
+						"translation.x": 0.0,
+						"translation.y": 2223.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 0,
+					"type": "text"
+				},
+				{
+					"buffer": 2,
+					"file": "/home/cian/Workspaces/sawtooth/sawtooth-core/validator/journal/consensus/poet1/poet_consensus.py",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 11613,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								9793,
+								9793
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/Python/Python.sublime-syntax"
+						},
+						"translation.x": 0.0,
+						"translation.y": 3021.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 2,
+					"type": "text"
+				},
+				{
+					"buffer": 3,
+					"file": "/home/cian/Workspaces/sawtooth/sawtooth-core/core/sawtooth/validator_config.py",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 13328,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								12705,
+								12705
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/Python/Python.sublime-syntax"
+						},
+						"translation.x": 0.0,
+						"translation.y": 6088.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 6,
+					"type": "text"
+				}
+			]
+		},
+		{
+			"selected": 1,
+			"sheets":
+			[
+				{
+					"buffer": 4,
+					"file": "/home/cian/Workspaces/sawtooth/sawtooth-core/validator/txnmain/validator_cli.py",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 19677,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								1179,
+								1179
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/Python/Python.sublime-syntax"
+						},
+						"translation.x": 0.0,
+						"translation.y": 0.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 4,
+					"type": "text"
+				},
+				{
+					"buffer": 5,
+					"file": "/home/cian/Workspaces/sawtooth/sawtooth-core/validator/journal/journal_core.py",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 60347,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								27926,
+								27926
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/Python/Python.sublime-syntax"
+						},
+						"translation.x": 0.0,
+						"translation.y": 18380.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 3,
+					"type": "text"
+				},
+				{
+					"buffer": 6,
+					"file": "/home/cian/Workspaces/sawtooth/sawtooth-core/validator/journal/consensus/consensus.py",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 3461,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								1907,
+								1907
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/Python/Python.sublime-syntax"
+						},
+						"translation.x": 0.0,
+						"translation.y": 0.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 5,
+					"type": "text"
+				}
+			]
+		}
+	],
+	"incremental_find":
+	{
+		"height": 35.0
+	},
+	"input":
+	{
+		"height": 35.0
+	},
+	"layout":
+	{
+		"cells":
+		[
+			[
+				0,
+				0,
+				1,
+				1
+			],
+			[
+				1,
+				0,
+				2,
+				1
+			]
+		],
+		"cols":
+		[
+			0.0,
+			0.485033025076,
+			1.0
+		],
+		"rows":
+		[
+			0.0,
+			1.0
+		]
+	},
+	"menu_visible": true,
+	"output.find_results":
+	{
+		"height": 0.0
+	},
+	"pinned_build_system": "",
+	"project": "northern-lights.sublime-project",
+	"replace":
+	{
+		"height": 64.0
+	},
+	"save_all_on_build": true,
+	"select_file":
+	{
+		"height": 0.0,
+		"last_filter": "",
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"select_project":
+	{
+		"height": 0.0,
+		"last_filter": "",
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"select_symbol":
+	{
+		"height": 0.0,
+		"last_filter": "",
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"selected_group": 0,
+	"settings":
+	{
+	},
+	"show_minimap": false,
+	"show_open_files": false,
+	"show_tabs": true,
+	"side_bar_visible": true,
+	"side_bar_width": 206.0,
+	"status_bar_visible": true,
+	"template_settings":
+	{
+	}
+}
